@@ -44,8 +44,19 @@ aws-lambda-version-cleaner/
 
 ## Two-stage deletion candidacy
 
-A version is marked `candidate_for_deletion=true` only when **both** stages
-pass.
+A version reaches the candidacy pipeline if it was published with SnapStart
+(`SnapStart.ApplyOn = PublishedVersions`) **and** its current `State` is one
+of `Active`, `Inactive`, or `Failed`:
+
+- `Active` — the normal case (in use / recently invoked).
+- `Inactive` — idle >14 days; Lambda has already dropped the cached
+  snapshot, but the version still clutters the list and is safe to delete.
+- `Failed` — SnapStart pre-snapshot init raised (commonly
+  `StateReasonCode = FunctionError`). The version can never be invoked and
+  can never self-recover.
+
+A version is then marked `candidate_for_deletion=true` only when **both**
+Stage A and Stage B pass.
 
 ### Stage A — age + keep-last-N (cheap pre-filter)
 
@@ -184,9 +195,9 @@ duration. Intermediate bulky row lists are offloaded to S3 so per-phase
 checkpoints stay under Lambda's 256 KiB limit.
 
 ```
-discover-snapstart          # ListFunctions, keep SnapStart=On rows
+discover-snapstart          # ListFunctions, keep SnapStart.ApplyOn=PublishedVersions rows
   └─▶ intermediate/<exec>/01-snapstart.json
-confirm-active              # GetFunctionConfiguration per version, keep State=Active
+confirm-active              # GetFunctionConfiguration per version, keep State in {Active, Inactive, Failed}
   └─▶ intermediate/<exec>/02-active.json
 stage-a-age-and-keep-last-n # annotate age_days + is_among_keep_last_n
   └─▶ intermediate/<exec>/03-stage-a.json

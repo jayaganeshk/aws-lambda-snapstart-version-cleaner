@@ -150,6 +150,15 @@ Resources:
       # durable-function invokes against an unqualified ARN. Manual invokes
       # should also target this alias so behaviour matches scheduled runs.
       AutoPublishAlias: live
+      # AutoPublishCodeSha256 forces a new Lambda version + alias update even
+      # when the code bundle is unchanged. Without this, SAM's auto-publish
+      # only triggers on code changes, so flipping DeleteDryRun via
+      # --parameter-overrides would update $LATEST's env var but leave the
+      # :live alias pinned at an older version with the old env var baked in.
+      # Tying this string to DeleteDryRun means every change to that
+      # parameter (the one that actually governs whether deletes execute)
+      # produces a fresh version and repoints :live at it.
+      AutoPublishCodeSha256: !Ref DeleteDryRun
       # DurableConfig enables Lambda Durable Functions on this function.
       # ExecutionTimeout covers the whole multi-invocation durable execution (including the human-approval wait).
       # RetentionPeriod controls how long Lambda keeps checkpoint / execution history after completion.

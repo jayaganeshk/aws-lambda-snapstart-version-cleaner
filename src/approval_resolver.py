@@ -202,7 +202,10 @@ def _render_confirm_page(decision: str, callback_id: str, bundle: dict[str, Any]
     """
     candidate_count = len(bundle.get("candidates") or [])
     summary = bundle.get("summary") or {}
-    total_scanned = summary.get("total_snapstart_active_versions", "?")
+    total_scanned = summary.get(
+        "total_deletable_state_versions",
+        summary.get("total_snapstart_active_versions", "?"),
+    )
     region = (summary.get("scan_config") or {}).get("region", "?")
 
     safe_cb = html.escape(callback_id, quote=True)

@@ -1,0 +1,7 @@
+{
+  "approved": true,
+  "approved_versions": [
+    { "function_name": "example-fn", "version": "12" },
+    { "function_name": "example-fn", "version": "15" }
+  ]
+}

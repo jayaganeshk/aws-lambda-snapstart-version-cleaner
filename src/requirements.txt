@@ -1,0 +1,11 @@
+# Only list dependencies that are NOT provided by the Lambda python3.13
+# runtime. boto3 / botocore / urllib3 are runtime-provided, so we don't
+# pin them here -- adding them would bloat the bundle and risk a mismatch
+# against the runtime's version.
+#
+# aws-durable-execution-sdk-python IS shipped in the Durable Functions
+# runtime variant, but we still bundle it so /var/task/ shadows the
+# runtime copy. That pins the SDK's API to whatever pip resolves at
+# build time (the runtime-bundled version has drifted from pip in ways
+# that break `context.execution_context.durable_execution_arn`).
+aws-durable-execution-sdk-python

@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SnapStart Lambda Version Cleaner durable-function orchestrator.
+  Scans a region, classifies SnapStart-enabled published versions as
+  deletion candidates via a two-stage check, publishes an SNS email
+  with one-click Approve/Reject links, then (after approval) runs the
+  delete step against the approved list.
+
+Parameters:
+  TargetRegion:
+    Type: String
+    Default: us-west-2
+    Description: Region the orchestrator scans. Distinct from the region the stack is deployed to.
+  ApproverEmail:
+    Type: String
+    Description: >
+      Email address that will receive approval notifications. Must confirm
+      the subscription email AWS sends after deploy before the flow works.
+      Additional recipients can be added as SNS subscriptions after deploy.
+    AllowedPattern: ".+@.+\\..+"
+  DeleteDryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When "true" the post-approval delete step logs would-be deletions
+      instead of calling lambda:DeleteFunction. Flip to "false" only after
+      validating the flow end-to-end in a non-prod account.
+  WeeklyScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Whether the weekly EventBridge schedule that kicks off the orchestrator
+      is active. Defaults to DISABLED so a fresh deploy never sends unsolicited
+      approval emails; flip to ENABLED once you've confirmed the SNS
+      subscription and validated the flow end-to-end in a non-prod account.
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 512
+    Runtime: python3.13
+    Architectures: [x86_64]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Approval plumbing: SNS topic (email fanout), S3 bundle bucket (stores the
+  # pending candidate list keyed by callback_id so the one-click links only
+  # need to carry the short id), and the resolver Lambda behind a public
+  # Function URL that turns a click into a durable-execution callback.
+  # ---------------------------------------------------------------------------
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: snapstart-version-cleaner-approvals
+      DisplayName: SnapStart Cleaner
+      Subscription:
+        - Endpoint: !Ref ApproverEmail
+          Protocol: email
+
+  ApprovalBundleBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Auto-generated name avoids global-namespace collisions across accounts.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Pending bundles outlive the 7-day approval window by 1 day so
+          # very-late clicks still resolve cleanly, then are auto-expired.
+          - Id: ExpirePendingCallbacks
+            Status: Enabled
+            Prefix: pending-callbacks/
+            ExpirationInDays: 8
+          # reports/ holds the full scan output keyed by durable execution id;
+          # 30 days matches DurableConfig.RetentionPeriodInDays so audit trails
+          # line up with the retained execution state.
+          - Id: ExpireScanReports
+            Status: Enabled
+            Prefix: reports/
+            ExpirationInDays: 30
+          # intermediate/ holds per-phase row lists written by the scan
+          # pipeline (discover / active / stage-a / stage-b). They are only
+          # needed for the duration of an in-flight execution + a short
+          # retry window, so expire them aggressively.
+          - Id: ExpireScanIntermediates
+            Status: Enabled
+            Prefix: intermediate/
+            ExpirationInDays: 3
+
+  ApprovalResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: snapstart-version-cleaner-approval-resolver
+      CodeUri: src/
+      Handler: approval_resolver.lambda_handler
+      Description: Turns one-click Approve/Reject URLs into durable-execution callbacks.
+      Environment:
+        Variables:
+          APPROVAL_BUNDLE_BUCKET: !Ref ApprovalBundleBucket
+      # A public Function URL gives us a stable HTTPS endpoint with no
+      # API Gateway overhead. AuthType=NONE is acceptable for the POC
+      # because the callback_id (opaque, 48+ chars, one-shot, S3-deleted
+      # on use) is the capability token. For production: switch to
+      # AuthType=AWS_IAM + SigV4-signed links, or wrap the handler with
+      # an HMAC verification against a secret in Secrets Manager.
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      Policies:
+        - Statement:
+            - Sid: ReadAndClearPendingBundle
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub "${ApprovalBundleBucket.Arn}/pending-callbacks/*"
+            - Sid: ResolveDurableCallback
+              Effect: Allow
+              Action:
+                - lambda:SendDurableExecutionCallbackSuccess
+                - lambda:SendDurableExecutionCallbackFailure
+              # Callback IDs are opaque and not part of an ARN pattern AWS
+              # exposes; scoping wider than "*" is not currently possible.
+              Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # The durable orchestrator itself.
+  # ---------------------------------------------------------------------------
+  VersionCleanerOrchestrator:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: snapstart-version-cleaner-orchestrator
+      CodeUri: src/
+      Handler: orchestrator.lambda_handler
+      Description: Durable orchestrator that identifies deletable SnapStart versions and waits for human approval.
+      # AutoPublishAlias makes SAM (1) publish a new immutable Lambda version
+      # on every deploy and (2) maintain the alias "live" pointing at it. The
+      # weekly ScheduleV2 event below is automatically rewired to invoke
+      # <function-arn>:live, which is a qualified ARN -- Lambda rejects async
+      # durable-function invokes against an unqualified ARN. Manual invokes
+      # should also target this alias so behaviour matches scheduled runs.
+      AutoPublishAlias: live
+      # DurableConfig enables Lambda Durable Functions on this function.
+      # ExecutionTimeout covers the whole multi-invocation durable execution (including the human-approval wait).
+      # RetentionPeriod controls how long Lambda keeps checkpoint / execution history after completion.
+      DurableConfig:
+        ExecutionTimeout: 604800   # 7 days (seconds) -- matches APPROVAL_TIMEOUT_SECONDS in orchestrator.py
+        RetentionPeriodInDays: 30  # keep execution history for 30 days (max 90)
+      Environment:
+        Variables:
+          DEFAULT_REGION: !Ref TargetRegion
+          APPROVAL_TOPIC_ARN: !Ref ApprovalTopic
+          APPROVAL_BUNDLE_BUCKET: !Ref ApprovalBundleBucket
+          APPROVAL_RESOLVER_URL: !GetAtt ApprovalResolverFunctionUrl.FunctionUrl
+          DELETE_DRY_RUN: !Ref DeleteDryRun
+      # EventBridge Scheduler (ScheduleV2) invokes the orchestrator
+      # asynchronously once a week. Async is mandatory here because the
+      # durable execution timeout (7 days) exceeds Lambda's 15-minute
+      # synchronous invoke cap -- scheduler-invoked Lambdas are always
+      # async which is exactly what we want. If a prior week's approval
+      # window is still open when the next tick fires, we just start a
+      # second concurrent durable execution; they don't share state and
+      # both get their own approval email.
+      Events:
+        WeeklyScan:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(7 days)
+            Description: Weekly SnapStart Lambda version cleanup scan.
+            State: !Ref WeeklyScheduleState
+            # Same shape as events/scan.json; the orchestrator merges
+            # these onto its internal defaults via normalize_config().
+            Input: !Sub |
+              {
+                "region": "${TargetRegion}",
+                "lookback_days": 30,
+                "min_age_days": 14,
+                "keep_last_n": 3,
+                "period_seconds": 3600,
+                "function_name_prefix": null,
+                "s3_report_uri": null
+              }
+      Policies:
+        - Statement:
+            - Sid: LambdaScan
+              Effect: Allow
+              Action:
+                - lambda:ListFunctions
+                - lambda:GetFunctionConfiguration
+                - lambda:ListAliases
+                - lambda:ListEventSourceMappings
+              Resource: "*"
+            - Sid: CloudWatchScan
+              Effect: Allow
+              Action:
+                - cloudwatch:GetMetricStatistics
+                - cloudwatch:GetMetricData
+              Resource: "*"
+            - Sid: LambdaDeleteAfterApproval
+              Effect: Allow
+              Action:
+                - lambda:DeleteFunction
+              # Scope this tighter in production (e.g. arn:aws:lambda:<region>:<account>:function:<prefix>*).
+              Resource: "*"
+            - Sid: PublishApprovalNotification
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref ApprovalTopic
+            - Sid: StorePendingApprovalBundle
+              Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource:
+                # pending-callbacks/ holds one JSON bundle per awaiting approval,
+                # keyed by callback_id and consumed (deleted) by the resolver.
+                # reports/ holds the full scan report, offloaded so durable
+                # step checkpoints stay under the 256 KiB payload cap.
+                # intermediate/ holds per-phase row lists (discover / active /
+                # stage-a / stage-b) used to chain the scan as separate
+                # durable steps without blowing the 256 KiB checkpoint cap.
+                - !Sub "${ApprovalBundleBucket.Arn}/pending-callbacks/*"
+                - !Sub "${ApprovalBundleBucket.Arn}/reports/*"
+                - !Sub "${ApprovalBundleBucket.Arn}/intermediate/*"
+            - Sid: ReadScanIntermediates
+              Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                # Only the scan pipeline reads these back -- the resolver and
+                # the orchestrator's own retry path. Scope tight so a compromised
+                # orchestrator cannot exfiltrate unrelated bucket contents.
+                - !Sub "${ApprovalBundleBucket.Arn}/intermediate/*"
+                - !Sub "${ApprovalBundleBucket.Arn}/reports/*"
+
+Outputs:
+  OrchestratorFunctionName:
+    Description: Name of the durable orchestrator function.
+    Value: !Ref VersionCleanerOrchestrator
+  OrchestratorFunctionArn:
+    Description: Unqualified ARN of the orchestrator function (informational; do not invoke directly).
+    Value: !GetAtt VersionCleanerOrchestrator.Arn
+  OrchestratorAliasArn:
+    Description: >
+      Qualified ARN of the orchestrator's "live" alias. Use this for manual
+      async invokes and EventBridge targets; durable functions reject invokes
+      against unqualified ARNs.
+    Value: !Ref VersionCleanerOrchestrator.Alias
+  ApprovalTopicArn:
+    Description: SNS topic the orchestrator publishes approval emails to. Add more subscribers here.
+    Value: !Ref ApprovalTopic
+  ApprovalBundleBucketName:
+    Description: Bucket holding per-callback pending-approval bundles (auto-expiring).
+    Value: !Ref ApprovalBundleBucket
+  ApprovalResolverUrl:
+    Description: Public HTTPS endpoint that backs the Approve/Reject links embedded in approval emails.
+    Value: !GetAtt ApprovalResolverFunctionUrl.FunctionUrl
+  WeeklyScanScheduleName:
+    Description: Name of the EventBridge Scheduler that runs the orchestrator weekly.
+    Value: !Ref VersionCleanerOrchestratorWeeklyScan

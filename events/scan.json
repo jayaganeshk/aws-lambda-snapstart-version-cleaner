@@ -1,0 +1,9 @@
+{
+  "region": "us-west-2",
+  "lookback_days": 30,
+  "min_age_days": 14,
+  "keep_last_n": 3,
+  "period_seconds": 3600,
+  "function_name_prefix": null,
+  "s3_report_uri": null
+}

@@ -68,13 +68,26 @@ def build_clients(region: str):
 def step1_discover_snapstart(lambda_client, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Single paginated ListFunctions(FunctionVersion="ALL"), filtered inline to
-    published versions with SnapStart.OptimizationStatus == "On".
+    published versions that were configured with SnapStart at publish time
+    (SnapStart.ApplyOn == "PublishedVersions").
+
+    We intentionally do NOT gate on OptimizationStatus == "On" here. Lambda
+    flips OptimizationStatus to "Off" on two classes of version that are
+    still legitimate cleanup targets:
+
+      - Idle versions: after ~14 days without invocations Lambda drops the
+        cached snapshot and sets OptimizationStatus="Off". The version still
+        exists, still clutters the version list, and is safe to delete.
+      - Failed versions: SnapStart pre-snapshot init raised, the version
+        landed in State=Failed, OptimizationStatus never became "On" (or
+        was flipped Off). These versions can never be invoked and are
+        dead weight.
 
     The ListFunctions response already contains the SnapStart dict per row, so
     we do not need a GetFunctionConfiguration round-trip just to know which
-    versions are SnapStart-enabled. State is NOT populated in this response
+    versions were SnapStart-configured. State is NOT populated in this response
     (verified in us-west-2), so step2_confirm_active still re-fetches for the
-    kept subset.
+    kept subset to apply the deletable-state filter.
     """
     name_prefix = cfg.get("function_name_prefix")
     paginator = lambda_client.get_paginator("list_functions")
@@ -87,7 +100,7 @@ def step1_discover_snapstart(lambda_client, cfg: dict[str, Any]) -> list[dict[st
             if name_prefix and not fn.get("FunctionName", "").startswith(name_prefix):
                 continue
             snap = fn.get("SnapStart") or {}
-            if snap.get("OptimizationStatus") != "On":
+            if snap.get("ApplyOn") != "PublishedVersions":
                 continue
             kept.append(
                 {
@@ -105,8 +118,12 @@ def step1_discover_snapstart(lambda_client, cfg: dict[str, Any]) -> list[dict[st
 
 
 # ---------------------------------------------------------------------------
-# Step 2 - Confirm State == "Active" per SnapStart candidate
+# Step 2 - Confirm terminal deletable state per SnapStart candidate
+#          (Active | Inactive | Failed)
 # ---------------------------------------------------------------------------
+DELETABLE_STATES = frozenset({"Active", "Inactive", "Failed"})
+
+
 def step2_confirm_active(
     lambda_client,
     snapstart_versions: list[dict[str, Any]],
@@ -114,8 +131,21 @@ def step2_confirm_active(
 ) -> list[dict[str, Any]]:
     """
     For each SnapStart candidate, call GetFunctionConfiguration with the
-    version qualifier to confirm State == "Active". Any non-Active rows are
-    dropped (PendingDelete / Failed / Inactive etc).
+    version qualifier and keep rows in a terminal, deletable state:
+
+      Active    - normal; in use or recently invoked.
+      Inactive  - idle >14d; Lambda already dropped the snapshot. Still
+                  deletable and the most common post-SnapStart-rollout
+                  cleanup target.
+      Failed    - init-time error (SnapStart pre-snapshot failure, etc).
+                  Can never be invoked, can never self-recover.
+
+    Pending and PendingDelete are dropped because DeleteFunction races with
+    Lambda's own state machine for those.
+
+    The step name is kept as step2_confirm_active for backwards
+    compatibility with existing durable-execution checkpoints; the
+    behaviour is now "confirm terminal state".
     """
     _ = cfg  # unused; kept to match the orchestrator signature
     kept: list[dict[str, Any]] = []
@@ -133,10 +163,13 @@ def step2_confirm_active(
                 file=sys.stderr,
             )
             continue
-        if cfg_resp.get("State") != "Active":
+        state = cfg_resp.get("State")
+        if state not in DELETABLE_STATES:
             continue
         enriched = dict(v)
-        enriched["State"] = cfg_resp.get("State")
+        enriched["State"] = state
+        enriched["StateReasonCode"] = cfg_resp.get("StateReasonCode")
+        enriched["StateReason"] = cfg_resp.get("StateReason")
         enriched["LastModified"] = cfg_resp.get("LastModified") or v.get("LastModified")
         kept.append(enriched)
     return kept
@@ -447,7 +480,10 @@ def step5_build_report(
                 "version": r["Version"],
                 "runtime": r.get("Runtime"),
                 "state": r.get("State"),
+                "state_reason_code": r.get("StateReasonCode"),
+                "state_reason": r.get("StateReason"),
                 "snapstart_optimization_status": r.get("SnapStartOptimizationStatus"),
+                "snapstart_apply_on": r.get("SnapStartApplyOn"),
                 "last_modified": r.get("LastModified"),
                 "age_days": r.get("age_days"),
                 "is_among_keep_last_n": r.get("is_among_keep_last_n"),
@@ -462,9 +498,15 @@ def step5_build_report(
             }
         )
 
+    state_counts: dict[str, int] = {}
+    for r in scored_rows:
+        s = r.get("State") or "Unknown"
+        state_counts[s] = state_counts.get(s, 0) + 1
+
     return {
         "summary": {
-            "total_snapstart_active_versions": len(scored_rows),
+            "total_deletable_state_versions": len(scored_rows),
+            "state_breakdown": state_counts,
             "stage_a_pass": stage_a_pass,
             "stage_b_pass": stage_b_pass,
             "candidates_for_deletion": candidates,
@@ -581,7 +623,7 @@ def step_confirm_active(
     bundle_bucket: str,
     execution_id: str,
 ) -> dict[str, Any]:
-    """Phase 2: GetFunctionConfiguration per candidate, keep State=Active."""
+    """Phase 2: GetFunctionConfiguration per candidate, keep State in {Active, Inactive, Failed}."""
     snapstart_rows = _get_intermediate(s3_client, discover_handle)
     active = step2_confirm_active(lambda_client, snapstart_rows, cfg)
     handle = _put_intermediate(s3_client, bundle_bucket, execution_id, "02-active", active)
@@ -757,9 +799,13 @@ def _format_approval_email(
     lines.append("")
     lines.append("=== SUMMARY ===")
     lines.append(
-        f"  Total SnapStart Active versions scanned : "
-        f"{summary.get('total_snapstart_active_versions', 0)}"
+        f"  Total SnapStart versions scanned        : "
+        f"{summary.get('total_deletable_state_versions', summary.get('total_snapstart_active_versions', 0))}"
     )
+    state_breakdown = summary.get("state_breakdown") or {}
+    if state_breakdown:
+        parts = ", ".join(f"{s}={n}" for s, n in sorted(state_breakdown.items()))
+        lines.append(f"  State breakdown                         : {parts}")
     lines.append(f"  Stage A pass (age + keep_last_n)        : {summary.get('stage_a_pass', 0)}")
     lines.append(f"  Stage B pass (no usage, no alias)       : {summary.get('stage_b_pass', 0)}")
     lines.append(
@@ -1011,9 +1057,13 @@ def _format_completion_email(
     if summary:
         lines.append("=== SCAN SUMMARY ===")
         lines.append(
-            f"  Total SnapStart Active versions scanned : "
-            f"{summary.get('total_snapstart_active_versions', 0)}"
+            f"  Total SnapStart versions scanned        : "
+            f"{summary.get('total_deletable_state_versions', summary.get('total_snapstart_active_versions', 0))}"
         )
+        state_breakdown = summary.get("state_breakdown") or {}
+        if state_breakdown:
+            parts = ", ".join(f"{s}={n}" for s, n in sorted(state_breakdown.items()))
+            lines.append(f"  State breakdown                         : {parts}")
         lines.append(f"  Stage A pass (age + keep_last_n)        : {summary.get('stage_a_pass', 0)}")
         lines.append(f"  Stage B pass (no usage, no alias)       : {summary.get('stage_b_pass', 0)}")
         lines.append(f"  Candidates presented for approval       : {summary.get('candidates_for_deletion', 0)}")
